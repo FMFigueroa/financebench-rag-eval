@@ -37,6 +37,7 @@ results/**/checkpoints/
 # Secrets — NUNCA commitear
 .env
 .env.*
+!.env.example
 *.key
 secrets/
 
