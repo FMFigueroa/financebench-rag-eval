@@ -4,7 +4,9 @@ Confirms that PyTorch can use the available accelerator (MPS on Apple Silicon,
 CUDA on NVIDIA GPUs) or falls back to CPU. Also runs a tiny embedding test
 to confirm the full stack is functional end-to-end.
 """
+
 import time
+
 import torch
 from sentence_transformers import SentenceTransformer
 
@@ -41,13 +43,14 @@ def smoke_test(device: str) -> None:
     embeddings = model.encode(sentences, convert_to_tensor=True)
     embed_time = time.time() - t0
 
-    print(f"   Embedded {len(sentences)} sentences in {embed_time*1000:.0f}ms")
+    print(f"   Embedded {len(sentences)} sentences in {embed_time * 1000:.0f}ms")
     print(f"   Embedding shape: {tuple(embeddings.shape)}")
     print(f"   Embedding dtype: {embeddings.dtype}")
     print(f"   Embedding device: {embeddings.device}")
 
     # Cosine similarity sanity check
     from torch.nn.functional import cosine_similarity
+
     sim_01 = cosine_similarity(embeddings[0:1], embeddings[1:2]).item()
     sim_02 = cosine_similarity(embeddings[0:1], embeddings[2:3]).item()
     print(f"\n   Cosine sim (Apple vs Microsoft revenue): {sim_01:.3f}")
