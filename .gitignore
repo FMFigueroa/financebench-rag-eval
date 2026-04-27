@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data (large files, never commit)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Models (uploaded to HuggingFace, not Git)
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Results: keep small JSON/CSV, ignore heavy plots/checkpoints
+results/**/*.png
+results/**/*.pdf
+results/**/checkpoints/
+
+# Secrets — NUNCA commitear
+.env
+.env.*
+*.key
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MLflow / W&B
+mlruns/
+wandb/
