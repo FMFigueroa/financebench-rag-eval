@@ -16,6 +16,9 @@ env/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# Personal learning copies (Spanish translations, not for public repo)
+notebooks/*_ES.ipynb
+
 # Data (large files, never commit)
 data/raw/*
 data/processed/*
