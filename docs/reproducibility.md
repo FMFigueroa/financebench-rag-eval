@@ -36,6 +36,47 @@ All non-deterministic operations use a fixed seed. Default: `SEED = 42`.
 
 Dataset download scripts live in `scripts/` and pin exact revisions.
 
+### Why source data is not committed
+
+This repository **does not commit source data**. The 84 FinanceBench PDFs
+(~165 MB) and any future corpora live under `data/raw/` and `data/processed/`,
+both gitignored. Three reasons drive this convention:
+
+1. **Repository hygiene**: Git is not designed for large binary blobs. Storing
+   PDFs in the history would inflate clone size and make `git log` operations
+   slow as the project grows.
+2. **Licensing**: FinanceBench is distributed under `CC-BY-NC-4.0` by Patronus
+   AI. Re-distributing the PDFs in a separate public repo enters a legally
+   ambiguous zone. Pointing users at the upstream source is cleaner.
+3. **Single source of truth**: the upstream Patronus repo is the canonical
+   location. Duplicating data here means future updates require manual sync.
+
+### How users obtain the data
+
+The download scripts in `scripts/` are the **recipe**. They are idempotent
+(skip files already present) and parallelized (8 workers). After a fresh clone:
+
+```bash
+uv sync
+uv run python scripts/download_pdfs.py     # FinanceBench PDFs (~84 files, ~165 MB, ~10 s)
+# Future: uv run python scripts/download_finmteb.py
+```
+
+The HuggingFace `datasets` cache (`~/.cache/huggingface/datasets/`) handles the
+QA pairs and metadata automatically — no extra script needed for those.
+
+### Corpus integrity
+
+Each download script logs:
+
+- Number of files expected vs. downloaded
+- Total bytes
+- Any failures (with the upstream URL for manual retry)
+
+If integrity matters for a specific experiment (e.g., a reviewer checks our
+results), pin the upstream commit SHA in the script's `BASE_URL` instead of
+relying on `main`. We do this once a `v1.0.0` release is cut.
+
 ## Running experiments
 
 > **TODO**: fill in once the eval pipeline is implemented.
