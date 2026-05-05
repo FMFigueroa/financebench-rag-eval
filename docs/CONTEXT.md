@@ -140,6 +140,8 @@ The `evidence` field is what makes FinanceBench a **rigorous benchmark**: withou
 
 Each question carries **two independent labels** in the dataset. These dimensions are **orthogonal** — neither is a difficulty hierarchy of the other. A `metrics-generated` question can be easy or hard; a `novel-generated` one can be trivial or complex. The difference is in their **origin**, not their inherent complexity.
 
+**Why these specific categories?** Because the PDF of a 10-K has **3 distinct types of content**, and each `question_type` reflects one. The classification is not arbitrary — it follows the structure of the actual document.
+
 #### `question_type` — origin / style of the question
 
 | Category | Origin | Example | Why Patronus created it |
@@ -148,7 +150,18 @@ Each question carries **two independent labels** in the dataset. These dimension
 | **`domain-relevant`** | Written by humans with **clear focus** on 10-K aspects (risks, governance, strategy) | *"What are the main risks 3M identifies in its 2018 annual report?"* | Cover more natural questions, still structured |
 | **`novel-generated`** | Human questions **without template or fixed pattern** — the most "wild" | *"How is Pfizer's R&D pipeline positioning the company in oncology?"* — free format | **Stress test**: replicates how a real user would ask questions in natural language |
 
-**Why this matters**: a RAG system can do well on `metrics-generated` (predictable templates) but **fail miserably on `novel-generated`** — that would reveal the system overfits to prompt style instead of understanding semantics. The novel category is the benchmark's stress test for true generalization.
+##### Detailed view — what in the PDF generates each category
+
+**`metrics-generated`** → originates in the **standardized financial statements** (Income Statement, Balance Sheet, Cash Flow Statement). These tables have identical structure across all companies (SEC regulation), with standard line items: `Net sales`, `Capital expenditures`, `Long-term debt`, etc. Patronus took a list of standard metrics and applied rigid templates of the form *"What is the {metric} for {company} in fiscal year {year}?"* — one template generates 50+ questions varying parameters.
+> Real example: 3M 2018 10-K, page 59 (Statement of Cash Flows): line `Purchases of property, plant and equipment ... $(1,577)` → templated question yields the literal answer **$1,577M**.
+
+**`domain-relevant`** → originates in the **mandatory narrative sections** of the 10-K: Item 1 (Business), Item 1A (Risk Factors), Item 7 (MD&A). These sections are predictable in their existence (every 10-K has them) but variable in content (each company describes its own risks). Humans wrote questions with clear focus on these sections but free format.
+> Real example: 3M 2018 10-K, Item 1A → several paragraphs describing PFAS contamination, litigation, supply chain disruption → question *"What are the main risks 3M identifies?"* requires reading and synthesizing prose, no single value to extract.
+
+**`novel-generated`** → originates in **information that crosses sections** of the 10-K in ways an analyst judges relevant but that don't follow any established pattern. Combines metrics from financial statements with narrative from MD&A and risks from Item 1A. The "stress test" of the benchmark.
+> Real example: Pfizer 2022 10-K → question *"How is Pfizer's R&D pipeline positioning the company in oncology?"* requires crossing 3 sections (R&D spend in Income Statement + pipeline narrative in Item 1 Business + competitive risks in Item 1A).
+
+**Why this matters for evaluation**: a RAG system can do well on `metrics-generated` (predictable templates) but **fail miserably on `novel-generated`** — that would reveal the system overfits to prompt style instead of understanding semantics. The novel category forces true generalization.
 
 #### `question_reasoning` — type of reasoning required
 
@@ -157,6 +170,17 @@ Each question carries **two independent labels** in the dataset. These dimension
 | **Information extraction** | Direct lookup of the value in the text | *"What was 3M's revenue in 2018?"* → read the figure |
 | **Numerical reasoning** | Extract numbers + compute | *"What was the YoY growth rate?"* → compute `(new - old) / old` |
 | **Logical reasoning (multi-step)** | Combine inferences and comparisons | *"Did CapEx grow faster than revenue?"* → 4 numbers → 2 ratios → comparison |
+
+##### Detailed view — where the answer lives in the PDF
+
+**`Information extraction`** → the answer is **literal in a table cell or a direct prose mention**. The system just needs to find the correct chunk and return the text. No math, no inference.
+> Real example: 3M 2018 Income Statement → line `Net sales ... $32,765` → question *"What was 3M's revenue in FY2018?"* → answer **$32,765M** is literal in the PDF.
+
+**`Numerical reasoning`** → the answer is **NOT literal** in the PDF. The document contains the inputs (2+ values), but the result has to be computed by the downstream LLM after retrieval.
+> Real example: 3M 2017 Net sales = $31,657M, 2018 Net sales = $32,765M → question *"What was the YoY growth rate?"* → answer is **NOT in the PDF**, must compute `(32,765 - 31,657) / 31,657 = 3.5%`. The RAG system must retrieve a chunk containing both numbers (ideally the full year-over-year comparison table).
+
+**`Logical reasoning (multi-step)`** → the answer requires combining multiple pieces of information, possibly from **different sections of the PDF**. Extract data, compute intermediate ratios, compare results, emit a judgment.
+> Real example: question *"Did 3M's CapEx grow faster than its revenue between 2017 and 2018?"* → inputs in the PDF are 4 numbers from 2 different sections: Income Statement (Revenue 2017 + 2018) and Cash Flow Statement (CapEx 2017 + 2018). Process: extract → compute 2 growth ratios → compare → emit yes/no. The RAG system **must retrieve chunks from 2 different sections** of the 10-K. This is why ~23% of the dataset has 2-3 distinct evidences (see §6 dataset analysis).
 
 > **Caveat about `None`**: ~33% of questions (all `novel-generated`) have `question_reasoning = None`. That means **Patronus did not classify them**, NOT that they require more processing. A novel question can be simple extraction or complex numerical — Patronus left them free-form because their diversity makes them hard to bucket into fixed categories.
 

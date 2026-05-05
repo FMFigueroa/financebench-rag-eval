@@ -18,6 +18,7 @@ env/
 
 # Personal learning copies (Spanish translations, not for public repo)
 notebooks/*_ES.ipynb
+docs/*_ES.md
 
 # Data (large files, never commit)
 data/raw/*
