@@ -19,6 +19,7 @@
 9. [Descriptive statistics primer (min, mean, median, percentiles)](#9-descriptive-statistics-primer-min-mean-median-percentiles)
 10. [The RAG pipeline — retrieval, reranking, generation](#10-the-rag-pipeline--retrieval-reranking-generation)
 11. [How we measure success: retrieval metrics](#11-how-we-measure-success-retrieval-metrics)
+12. [Putting it all together — a worked example end-to-end](#12-putting-it-all-together--a-worked-example-end-to-end)
 
 ---
 
@@ -583,6 +584,391 @@ NDCG = DCG_actual / DCG_ideal
 Each one has a blind spot. **Reporting all 4 is academic standard** and protects us from cherry-picking ("look, my model has 95% Recall@10!" — yes, but MRR is 0.20 because it puts the correct ones in position 8).
 
 **Plus**: we report all of them with **bootstrap confidence intervals** (1000 resamples), so we don't present a single number but a range — honest scientific practice.
+
+---
+
+## 12. Putting it all together — a worked example end-to-end
+
+> **Goal of this section**: take ONE real question from FinanceBench and trace it through every step of the pipeline — PDF → chunks → embeddings → query → retrieval → reranking → metrics → generation. After reading this you should be able to say *"now I see how all the pieces from §1-§11 actually move together"*.
+
+§1-§11 are like a parts catalog: each component (filings, evidence, chunks, embedders, metrics) is documented in isolation. This section is the **assembly manual** — same parts, but in motion, on one concrete query.
+
+### 12.0 The case study
+
+We pick a single question from FinanceBench's 150 and follow it from start to finish.
+
+```
+company:              3M
+doc_name:             3M_2018_10K
+question:             "What was 3M's revenue YoY growth from 2017 to 2018?"
+question_type:        metrics-generated      ← origin label (§6)
+question_reasoning:   Numerical reasoning    ← reasoning label (§6)
+ground-truth answer:  3.5%
+evidence (1 item):    "Net sales ............ $32,765 (2018) ... $31,657 (2017)"
+                      Item 8 — Income Statement
+```
+
+Why this question? It hits the sweet spot for a teaching example:
+
+- **`Numerical reasoning`** → forces the distinction between *retrieval* (find the chunk with the numbers) and *generation* (do the arithmetic). This is the line we draw at the boundary of Stage 1.
+- **`metrics-generated`** → the answer lives in a structured table, so chunking strategy is testable.
+- **Single evidence** → simpler to follow Recall, MRR, NDCG, MAP without multi-evidence noise. We address multi-evidence at the end (§12.8).
+
+> ⚠️ The question text and `Net sales` figures come from 3M's real 2018 10-K Income Statement. The embedding values, cosine similarities, and chunk IDs shown in §12.2 onward are **illustrative of the typical behavior** — they reflect what a competent embedder produces on a question like this, but are not measured. The point is the *shape* of the flow, not the exact decimals.
+
+---
+
+### 12.1 What the system actually receives
+
+Critical distinction before we start: the system at query time only sees **the question string**. Everything else in the JSON record (tags, evidence, page numbers, ground-truth answer) is **dataset metadata** that the evaluator uses to *score* the system afterwards.
+
+```
+INPUT to the RAG system           METADATA (used by the evaluator only)
+─────────────────────────         ──────────────────────────────────────
+question (string)                 financebench_id
+                                  doc_name
+                                  question_type
+                                  question_reasoning
+                                  evidence (list of passages)
+                                  evidence_page_num
+                                  answer (ground truth)
+                                  justification
+```
+
+> 💡 Why this distinction matters: confusing "what the system sees" with "what we use to grade it" is the most common mistake when reading retrieval papers. The evidence is **never an input** — it's the answer key.
+
+---
+
+### 12.2 Indexing — turning the PDF corpus into a searchable vector space
+
+Indexing happens **once, offline**, before any query is asked. It has 3 steps.
+
+#### 12.2.1 PDF parsing
+
+The 3M 2018 10-K is a ~150-page PDF with prose, tables, footnotes, and exhibits. We run it through `pdfplumber` (chosen over `pypdf` because it preserves table structure better — see CLAUDE.md):
+
+```python
+import pdfplumber
+
+with pdfplumber.open("3M_2018_10K.pdf") as pdf:
+    pages = [p.extract_text() for p in pdf.pages]
+full_text = "\n".join(pages)
+```
+
+Output: ~300,000 tokens of cleaned text.
+
+> ⚠️ Gotcha: `pdfplumber` does NOT magically reconstruct tables as Markdown. The Income Statement comes out as raw text with column alignment loosely preserved. For naive chunking that's fine; for richer strategies (semantic, contextual) you'd post-process tables separately. We log this trade-off in `docs/decisions/`.
+
+#### 12.2.2 Chunking
+
+We split the 300K-token text into overlapping chunks. For this walkthrough we use **naive fixed-size chunking** (the baseline strategy from §8) — 512 tokens per chunk, 50 tokens overlap.
+
+Result: **~640 chunks** for this single document. A few representative ones:
+
+```
+chunk_id   content (truncated)                                        section
+─────────  ──────────────────────────────────────────────────────     ──────────────
+chunk_007  "...as a diversified technology company, 3M operates..."   Item 1 — Business
+chunk_142  "...risks related to the discontinuation of LIBOR..."      Item 1A — Risks
+chunk_287  "...non-GAAP measures discussed in this MD&A..."           Item 7 — MD&A
+chunk_312  "Net sales              $32,765   $31,657   $30,109        Item 8 — Income
+            Cost of sales           16,682    16,001    15,041        Statement
+            Gross profit            16,083    15,656    15,068..."
+chunk_487  "...Capital expenditures           (1,577)   (1,373)..."   Cash Flow Statement
+```
+
+The chunk we *want* the system to find for our question is **`chunk_312`**: it contains both `$32,765` (2018) and `$31,657` (2017) in the same window — exactly the evidence Patronus tagged.
+
+> 💡 Why chunking strategy matters: naive 512-token chunking *happened* to keep both years in the same window because the Income Statement is compact. If our chunker had split mid-table, the answer would be **fragmented across two chunks** and Recall@1 would be 0 even with a perfect embedder. Quantifying this kind of failure is exactly what the "4 chunking strategies" study (§8) is for.
+
+#### 12.2.3 Embedding
+
+Each of the ~640 chunks is passed through an embedder. For this example, OpenAI's `text-embedding-3-large`, which produces a **3072-dimensional vector** per chunk:
+
+```
+chunk_312 → [0.0142, -0.0287, 0.0913, ..., 0.0058]   ← 3072 floats
+```
+
+These vectors are stored in **Qdrant** (our vector store, see CLAUDE.md), each one paired with its original text and metadata (`chunk_id`, `page`, `doc_name`, etc.).
+
+After indexing the entire corpus, we have a **searchable index of ~640 vectors** for 3M's 10-K. (Across all 150 questions in FinanceBench, the full corpus has ~360 documents and ~230K chunks indexed.)
+
+> 🧠 Mental model: think of the vector space as a **3072-dimensional warehouse** where every chunk has a coordinate. Chunks about "revenue" cluster in one neighborhood, chunks about "litigation risk" in another, chunks about "executive compensation" in a third. The embedder's job is to put semantically similar texts physically close in that space.
+
+---
+
+### 12.3 Query time — how the system answers ONE question
+
+#### 12.3.1 Embedding the query
+
+When the user (or the eval harness) submits the question, **the same embedder** is applied to the query string:
+
+```
+"What was 3M's revenue YoY growth from 2017 to 2018?"
+                         ↓ text-embedding-3-large
+[0.0198, -0.0341, 0.0876, ..., 0.0073]   ← also 3072-d
+```
+
+Now the query is a point in the **same warehouse** as the chunks.
+
+#### 12.3.2 Similarity scoring
+
+For every one of the ~640 chunks, the system computes the **cosine similarity** between the query vector and the chunk vector:
+
+```
+cos_sim(q, c) = (q · c) / (||q|| × ||c||)   →  value in [-1, 1]
+```
+
+Higher = more semantically similar. (Both vectors are L2-normalized at index time, so this reduces to a plain dot product — fast on GPU.) For our query, the resulting scores might look like:
+
+```
+chunk_id    cosine_sim   section                  notes
+─────────   ──────────   ───────────────────────  ─────────────────────────────
+chunk_312     0.847      Income Statement         ← contains BOTH years (ground truth!)
+chunk_287     0.812      MD&A                     discusses revenue trends, no exact #s
+chunk_410     0.794      Segment results          segment-level revenue 2018
+chunk_315     0.781      Comprehensive income     related but not exact
+chunk_007     0.776      Business overview        mentions 2018 sales generically
+chunk_487     0.512      Cash Flow Statement      CapEx (numerical but unrelated)
+chunk_142     0.234      Risk Factors             LIBOR risk (irrelevant)
+...
+```
+
+#### 12.3.3 Top-k retrieval
+
+We keep the top-5 chunks ranked by cosine similarity:
+
+```
+RANK   CHUNK_ID      SIM      IS_GROUND_TRUTH?
+────   ──────────    ─────    ─────────────────
+ 1     chunk_312     0.847    ✅ YES  ← evidence in position 1
+ 2     chunk_287     0.812    ❌
+ 3     chunk_410     0.794    ❌
+ 4     chunk_315     0.781    ❌
+ 5     chunk_007     0.776    ❌
+```
+
+This is what **Phase 1 (Retrieval)** of §10 produces. The pipeline could stop here — but for a stronger system, we add **Phase 2**.
+
+---
+
+### 12.4 Reranking — refining the top-k with a cross-encoder
+
+The top-5 above was ranked by **bi-encoder cosine** (cheap: query and chunks were embedded *independently*). A reranker like **Cohere Rerank v3.5** does something more expensive: it feeds **(query, chunk)** as a single joint input to a transformer that produces a relevance score, capturing fine-grained interaction between the two texts.
+
+For our example, reranking the top-5 might produce:
+
+```
+Before rerank (cosine)              After rerank (cross-encoder)
+──────────────────────────          ──────────────────────────────
+ 1. chunk_312  0.847  ✅             1. chunk_312  0.991  ✅  (kept #1)
+ 2. chunk_287  0.812                 2. chunk_410  0.823       (jumped from #3)
+ 3. chunk_410  0.794                 3. chunk_287  0.687       (dropped from #2)
+ 4. chunk_315  0.781                 4. chunk_315  0.612
+ 5. chunk_007  0.776                 5. chunk_007  0.354
+```
+
+The reranker recognizes that `chunk_410` (segment-level revenue breakdown) is more directly relevant to a *YoY growth* question than `chunk_287` (general MD&A prose) — a subtlety the bi-encoder cosine couldn't capture because the two texts were never seen together.
+
+> 💡 Why we don't always rerank everything: the cross-encoder is **~50× slower per pair** than a bi-encoder lookup. So the standard pipeline is "retrieve top-50 fast, rerank to top-5 carefully" — best of both worlds.
+
+---
+
+### 12.5 Computing the metrics for THIS single query
+
+Now we evaluate the result. The evaluator knows the ground-truth `chunk_312` is the only relevant one for this question. Plugging into §11's formulas:
+
+```
+Position of the relevant chunk after retrieval:    rank = 1
+Number of relevant chunks for this query:          1
+```
+
+#### Recall@k
+
+```
+Recall@1   = (was relevant in top-1?)   → YES → 1
+Recall@3   = (was relevant in top-3?)   → YES → 1
+Recall@5   = (was relevant in top-5?)   → YES → 1
+Recall@10  = (was relevant in top-10?)  → YES → 1
+```
+
+All Recall values are 1 for *this* query. (The aggregate Recall@5 across all 150 queries is what gets reported in the master table.)
+
+#### MRR — Reciprocal Rank for this single query
+
+```
+RR = 1 / position_of_first_relevant = 1 / 1 = 1.00
+```
+
+A perfect 1.00 because the relevant chunk landed in position 1.
+
+#### NDCG@5
+
+With one relevant chunk in position 1:
+
+```
+DCG   = relevance_1 / log2(1 + 1) = 1 / log2(2) = 1.00
+IDCG  = 1 / log2(1 + 1)                         = 1.00
+NDCG  = DCG / IDCG                              = 1.00
+```
+
+Also a perfect 1.00.
+
+#### MAP — Average Precision for this query
+
+```
+At the rank where the relevant lands (rank=1):
+  precision@1 = 1 relevant retrieved / 1 retrieved = 1.0
+AP = average of precisions at the ranks where relevants are found
+   = 1.0 / 1 relevant = 1.00
+```
+
+Also 1.00.
+
+> 🎯 Big idea: **for a single query, the metrics are just numbers — they only become meaningful when averaged over many queries**. Our query scores 1.00 across the board; another query where the relevant lands at rank 7 might score Recall@5 = 0, MRR = 0.143, NDCG@5 = 0. Reporting on the dataset means averaging the 150 per-query scores. This is what §11.5 means by "we use all 4 together" — each query gets 4 scores, and we aggregate over the dataset.
+
+---
+
+### 12.6 Generation — what the LLM does with the retrieved chunk (out of scope but instructive)
+
+This is **Phase 3** of §10, formally Eslabón 2 of the roadmap, but worth seeing once to understand why retrieval metrics matter so much.
+
+The top-1 chunk's text is concatenated with the question into a prompt for an LLM:
+
+```
+SYSTEM: You are a financial analyst. Answer using only the context below.
+
+CONTEXT:
+Net sales              $32,765   $31,657   $30,109
+Cost of sales           16,682    16,001    15,041
+Gross profit            16,083    15,656    15,068
+[... rest of chunk_312 ...]
+
+QUESTION: What was 3M's revenue YoY growth from 2017 to 2018?
+
+ANSWER:
+```
+
+A capable LLM (Claude, GPT-4, etc.) reads the table, identifies that the columns are labeled by year (or asks for clarification if ambiguous), and computes:
+
+```
+Growth = (32,765 - 31,657) / 31,657 = 0.035 = 3.5%
+```
+
+The LLM emits: *"3M's revenue grew 3.5% from $31,657M in 2017 to $32,765M in 2018."*
+
+> 💡 The retrieval-vs-generation handoff: notice that **if retrieval had failed** (e.g., delivered `chunk_142` about LIBOR risk instead of `chunk_312`), no LLM could recover — there are simply no numbers in that chunk to compute growth from. **Retrieval quality bounds generation quality.** That's why we measure retrieval rigorously in Stage 1 before adding generation in Eslabón 2.
+
+---
+
+### 12.7 From one query to 150 — what the master table actually looks like
+
+We run §12.1 → §12.5 for **all 150 questions**, then aggregate. For one (embedder × chunking strategy) cell, the result is roughly:
+
+```
+Embedder:           text-embedding-3-large
+Chunking strategy:  naive_512_overlap_50
+Reranker:           none (retrieval only)
+N queries:          150
+
+Recall@1   = 0.547  [bootstrap 95% CI: 0.467, 0.627]
+Recall@3   = 0.733  [bootstrap 95% CI: 0.660, 0.800]
+Recall@5   = 0.807  [bootstrap 95% CI: 0.740, 0.867]
+Recall@10  = 0.873  [bootstrap 95% CI: 0.813, 0.927]
+MRR        = 0.658  [bootstrap 95% CI: 0.582, 0.731]
+NDCG@10    = 0.706  [bootstrap 95% CI: 0.638, 0.770]
+MAP        = 0.612  [bootstrap 95% CI: 0.541, 0.682]
+```
+
+(Numbers illustrative; real values land in `results/baselines/` once Stage 1 is run.)
+
+This **single row** is the aggregation of 150 mini-versions of §12.0 → §12.5. The full master table has **5 embedders × 4 chunking strategies = 20 rows**, each computed exactly the same way. With reranking on/off it's 40 rows. That's the rigorous comparison the project promises.
+
+> 🔑 The bootstrap CIs are critical: a difference of `0.807 vs 0.815` between two embedders is meaningless if the CIs overlap heavily. Reporting raw numbers without CIs is how teams accidentally claim improvements that are statistical noise. See §11.5.
+
+---
+
+### 12.8 What changes with multi-evidence queries
+
+About **23% of FinanceBench questions** have **2 or 3 evidence passages** (e.g., a CapEx-vs-Revenue growth question requires the Income Statement *and* the Cash Flow Statement, in two different sections of the same 10-K). For those queries:
+
+- **Retrieval** has to surface multiple correct chunks, not just one.
+- **Recall@k** treats it as binary per chunk: did each relevant appear in top-k?
+- **MAP** is the metric that *really* differentiates here: it averages precision at the rank of *every* relevant. A system that lands 1 of 2 relevants in top-1 but misses the second scores AP = 0.5 even though MRR = 1.0.
+
+This is exactly why §11.5 reports all 4 metrics together: any single one is blind to a failure mode the others catch.
+
+---
+
+### 12.9 The complete picture — end-to-end flow at a glance
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ OFFLINE: INDEXING (done once)                                              │
+│                                                                            │
+│  3M_2018_10K.pdf  ──pdfplumber──▶  full_text (~300K tokens)                │
+│                                          │                                 │
+│                                    chunk into 512-token windows            │
+│                                          ▼                                 │
+│                                    ~640 chunks                             │
+│                                          │                                 │
+│                                    text-embedding-3-large                  │
+│                                          ▼                                 │
+│                                    ~640 vectors (3072-d)                   │
+│                                          │                                 │
+│                                          ▼                                 │
+│                                    Qdrant index ✔                          │
+└────────────────────────────────────────────────────────────────────────────┘
+                                            │
+─────────────────────────── one query at a time ──────────────────────────────
+                                            ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ ONLINE: QUERY                                                              │
+│                                                                            │
+│  "What was 3M's revenue YoY growth from 2017 to 2018?"                     │
+│                       │                                                    │
+│                       ▼ text-embedding-3-large                             │
+│             query_vector (3072-d)                                          │
+│                       │                                                    │
+│                       ▼ cosine vs all 640 chunk vectors                    │
+│             top-5 chunks  ←  PHASE 1: Retrieval                            │
+│                       │                                                    │
+│                       ▼ Cohere Rerank v3.5 (cross-encoder)                 │
+│             top-5 reranked  ←  PHASE 2: Reranking                          │
+│                       │                                                    │
+│         ┌─────────────┴──────────────┐                                     │
+│         ▼                            ▼                                     │
+│   EVAL (Stage 1)              GENERATION (Eslabón 2)                       │
+│   compute Recall@k,           feed top-1 chunk + question                  │
+│   MRR, NDCG, MAP              to Claude/GPT → "3.5%" answer                │
+│   on this query                                                            │
+│         │                                                                  │
+│         ▼ aggregate over 150 queries                                       │
+│   one row of the master table (with bootstrap 95% CIs)                     │
+│                                                                            │
+│   repeat for 5 embedders × 4 chunking strategies                           │
+│                       │                                                    │
+│                       ▼                                                    │
+│           20-row master table — the deliverable of Stage 2                 │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+If this diagram clicks — *that's* the moment §1-§11 stop being a list of techniques and become **one system**. Every box above maps back to a concept defined earlier:
+
+| Box in the diagram | Where it's defined |
+|---|---|
+| "PDF" | §3 — Filings |
+| "chunks" | §8 — Passages and chunks |
+| "embedder", "vector space" | §12.2.3 |
+| "Qdrant index" | CLAUDE.md (stack) |
+| "cosine + top-k" | §10 — Phase 1 |
+| "rerank" | §10 — Phase 2 |
+| "Recall / MRR / NDCG / MAP" | §11 |
+| "150 queries" | §6 — FinanceBench |
+| "bootstrap CIs" | §11.5 |
+| "generation" | §10 — Phase 3 (Eslabón 2) |
+
+That's the whole project in one picture. Welcome to RAG engineering.
 
 ---
 
