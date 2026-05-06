@@ -140,7 +140,19 @@ The `evidence` field is what makes FinanceBench a **rigorous benchmark**: withou
 
 ### How Patronus categorized the questions
 
-Each question carries **two independent labels** in the dataset. These dimensions are **orthogonal** — neither is a difficulty hierarchy of the other. A `metrics-generated` question can be easy or hard; a `novel-generated` one can be trivial or complex. The difference is in their **origin**, not their inherent complexity.
+Each question carries **two independent labels** in the dataset:
+
+- **`question_type`** — origin / style of the question
+  - `metrics-generated`
+  - `domain-relevant`
+  - `novel-generated`
+- **`question_reasoning`** — type of reasoning required to answer it
+  - `Information extraction`
+  - `Numerical reasoning`
+  - `Logical reasoning (multi-step)`
+  - `None` (`novel-generated` questions are unclassified)
+
+**Independent** means that **one label does not determine the other** — neither is a difficulty hierarchy of the other. A `metrics-generated` question can be easy or hard; a `novel-generated` one can be trivial or complex. The difference is in their **origin**, not their inherent complexity.
 
 **Why these specific categories?** Because the PDF of a 10-K has **3 distinct types of content**, and each `question_type` reflects one. The classification is not arbitrary — it follows the structure of the actual document.
 
@@ -154,13 +166,36 @@ Each question carries **two independent labels** in the dataset. These dimension
 
 ##### Detailed view — what in the PDF generates each category
 
-**`metrics-generated`** → originates in the **standardized financial statements** (Income Statement, Balance Sheet, Cash Flow Statement). These tables have identical structure across all companies (SEC regulation), with standard line items: `Net sales`, `Capital expenditures`, `Long-term debt`, etc. Patronus took a list of standard metrics and applied rigid templates of the form *"What is the {metric} for {company} in fiscal year {year}?"* — one template generates 50+ questions varying parameters.
+**`metrics-generated`** → originates in the **standardized financial statements** of the 10-K. A 10-K always contains 3 audited financial tables, each one regulated by SEC GAAP rules and structurally identical across all companies:
+
+- **Income Statement** — revenue, costs, profitability (`Net sales`, `Cost of goods sold`, `Operating income`, etc.)
+- **Balance Sheet** — assets, liabilities, equity (`Total assets`, `Long-term debt`, `Stockholders' equity`, etc.)
+- **Cash Flow Statement** — cash inflows/outflows (`Capital expenditures`, `Operating cash flow`, etc.)
+
+Patronus took a list of standard metrics from these tables and applied rigid templates of the form *"What is the {metric} for {company} in fiscal year {year}?"* — one template generates 50+ questions varying parameters.
+
 > Real example: 3M 2018 10-K, page 59 (Statement of Cash Flows): line `Purchases of property, plant and equipment ... $(1,577)` → templated question yields the literal answer **$1,577M**.
 
-**`domain-relevant`** → originates in the **mandatory narrative sections** of the 10-K: Item 1 (Business), Item 1A (Risk Factors), Item 7 (MD&A). These sections are predictable in their existence (every 10-K has them) but variable in content (each company describes its own risks). Humans wrote questions with clear focus on these sections but free format.
+**`domain-relevant`** → originates in the **mandatory narrative sections** of the 10-K. Beyond the audited financial tables, the 10-K has free-prose sections regulated by SEC item structure:
+
+- **Item 1** — Business (operations, products, markets, competition)
+- **Item 1A** — Risk Factors (specific risks the company identifies)
+- **Item 7** — MD&A (Management's Discussion and Analysis)
+
+*(See §3 — Anatomy of a 10-K — for the complete item structure.)*
+
+These sections are **predictable in their existence** (every 10-K has them) but **variable in content** (each company describes its own risks). Humans wrote questions with clear focus on these sections but free format.
+
 > Real example: 3M 2018 10-K, Item 1A → several paragraphs describing PFAS contamination, litigation, supply chain disruption → question *"What are the main risks 3M identifies?"* requires reading and synthesizing prose, no single value to extract.
 
-**`novel-generated`** → originates in **information that crosses sections** of the 10-K in ways an analyst judges relevant but that don't follow any established pattern. Combines metrics from financial statements with narrative from MD&A and risks from Item 1A. The "stress test" of the benchmark.
+**`novel-generated`** → originates in **information that crosses sections** of the 10-K. Instead of staying within one table or one item, novel questions combine signals from multiple parts of the document:
+
+- A **metric** from the financial statements (Income Statement / Balance Sheet / Cash Flow Statement)
+- A **narrative** from the qualitative items (Item 1 Business / Item 7 MD&A)
+- A **risk** from Item 1A
+
+Humans wrote these questions completely open, simulating how a real analyst explores a 10-K without a predefined agenda. Their unpredictability makes them the **stress test** of the benchmark.
+
 > Real example: Pfizer 2022 10-K → question *"How is Pfizer's R&D pipeline positioning the company in oncology?"* requires crossing 3 sections (R&D spend in Income Statement + pipeline narrative in Item 1 Business + competitive risks in Item 1A).
 
 **Why this matters for evaluation**: a RAG system can do well on `metrics-generated` (predictable templates) but **fail miserably on `novel-generated`** — that would reveal the system overfits to prompt style instead of understanding semantics. The novel category forces true generalization.
