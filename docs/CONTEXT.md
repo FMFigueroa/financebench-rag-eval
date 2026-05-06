@@ -136,6 +136,8 @@ For each of the 150 questions:
 
 The `evidence` field is what makes FinanceBench a **rigorous benchmark**: without ground truth, evaluation would be guesswork.
 
+> ⚠️ **Important about evidence structure**: the `evidence` field is a **list of 1 to 3 passages** (not a single text block). Each item has its own `evidence_text` and `evidence_page_num`. For ~23% of the dataset, a single question is justified by multiple passages — sometimes in **different sections of the same PDF** (e.g., a number from the Income Statement + a narrative from the Risk Factors section). This compositional structure is critical for understanding length statistics (§9) and chunking implications (§8).
+
 ### How Patronus categorized the questions
 
 Each question carries **two independent labels** in the dataset. These dimensions are **orthogonal** — neither is a difficulty hierarchy of the other. A `metrics-generated` question can be easy or hard; a `novel-generated` one can be trivial or complex. The difference is in their **origin**, not their inherent complexity.
@@ -216,6 +218,31 @@ The `evidence_text` field that ships with each FinanceBench question **is a pass
 
 These passages are **human-curated**: Patronus annotators read each 10-K and selected which fragment justifies each answer. That makes them the **ground truth** for evaluating retrieval.
 
+#### FinanceBench specifics — the compositional structure of `evidence`
+
+The `evidence` field is **NOT a single text block** — it's a **list of 1 to 3 items**, where each item is a distinct passage with its own metadata:
+
+```python
+evidence: [
+  {
+    "evidence_text": "...",              # the passage text
+    "evidence_text_full_page": "...",    # the entire PDF page where the passage lives
+    "evidence_page_num": 45,             # which page of the PDF
+    "doc_name": "3M_2018_10K"            # which document
+  },
+  # ... up to 3 items per question
+]
+```
+
+**Key implications**:
+
+- **76.7% of QAs have 1 passage** (single-evidence). The simplest case for retrieval.
+- **20.7% have 2 passages** and **2.7% have 3 passages**. ~23% of the dataset is **multi-evidence**.
+- When multi-evidence happens, **the passages can live in different sections of the same PDF** — for example, a number from the Income Statement (page 45) and a narrative from the Risk Factors section (page 12). The RAG system has to retrieve **both** to answer correctly.
+- In our analysis (Sub-block 2.4 of the notebook), we measured: when there are 2+ passages, **91% are within ≤5 pages of each other** (same section). Only ~9% are truly cross-section.
+
+This compositional structure is the reason why MAP exists as a metric: when there are multiple correct chunks, MRR only credits the first one, but MAP rewards retrieving them all (see §11).
+
 ### Why passages are the key unit in RAG
 
 If your RAG system operated on **entire documents** (200 pages → millions of tokens), the embedder couldn't process them (typical max ~512 tokens per call) and search would be imprecise (too much irrelevant context drowning the signal). If it operated on **individual words**, it would lose context.
@@ -284,17 +311,76 @@ When we report dataset analyses (lengths, evidence counts, coverage) and benchma
 
 ### Worked example: evidence lengths from our analysis
 
+The numbers below report **the total evidence length per question**, in characters. Important nuance: as explained in §6 and §8, each FinanceBench question has 1 to 3 passages (not a single text block). When a question has multiple passages — possibly from **different parts of the same PDF** (e.g., Income Statement page 45 + Risk Factors page 12) — we **sum the chars of all passages** to compute the "total evidence load" the RAG system would have to retrieve.
+
 ```
-evidence:  median = 1,450    mean = 1,712    p95 = 4,194    max = 12,123
+evidence (TOTAL length in characters, summed across all passages of each QA):
+  median  = 1,450 chars
+  mean    = 1,712 chars
+  p95     = 4,194 chars
+  max     = 12,123 chars
 ```
 
-Technical reading:
+**Technical reading of each number**:
 
-- **mean (1,712) > median (1,450)** → long tail to the right (some extremely long evidences pull the average up).
-- **p95 (4,194) << max (12,123)** → the max is an **extreme outlier**, almost 3× the p95. Only ~5% of the dataset reaches 4,194 chars; one isolated case shoots up to 12,123.
-- **median (1,450)** → **half** of the queries have evidence ≤ 1,450 chars. That's the "typical case" — more representative than the mean.
+- **median (1,450 chars)** → half of the evidences are ≤ 1,450 chars. This is the **typical case**.
+- **mean (1,712 chars) > median** → asymmetric distribution (see "long tail" below).
+- **p95 (4,194 chars)** → 95% of the dataset falls under 4,194 chars. Only the largest 5% exceeds that threshold.
+- **max (12,123 chars)** → the longest evidence in the dataset. **Almost 3× the p95** — an extreme outlier.
 
-**This is why we use median + percentiles instead of just mean**: the mean alone doesn't show you the shape. If you were told "the average evidence measures 1,712 chars", you'd think most of it is close to 1,712. With the full distribution, you see that **half is under 1,450** and that **there's a 12,123-char monster distorting the average**.
+#### What does "long tail" mean?
+
+When `mean (1,712) > median (1,450)`, the distribution is NOT symmetric. Most evidences are short or medium, but **a few extreme cases pull the average up**. Visualized:
+
+```
+Frequency (how many evidences fall in each range)
+  │
+  │  ▓▓▓▓▓▓▓
+  │  ▓▓▓▓▓▓▓▓▓▓
+  │  ▓▓▓▓▓▓▓▓▓▓▓▓▓
+  │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░ ........... ... ..    .       .
+  └──────────────────────────────────────────────────────────────────
+     0     1k    2k    3k    4k    5k   ...   8k   ...   10k  ...  12k  chars
+        ↑ median ↑ mean         ↑ p95                              ↑ max
+        (1,450) (1,712)        (4,194)                          (12,123)
+```
+
+The "tail" is the part on the right that extends out: few cases but VERY large. Technically called a **right-skewed distribution**.
+
+#### The operational WHY: why we measure this
+
+This isn't an academic metric — it **drives critical technical decisions** in the RAG system. The reasoning chain:
+
+```
+1. Evidence length (chars)         ← what we just measured
+   ↓ (rule of thumb: ~4 chars ≈ 1 token in English)
+2. Estimated tokens                ← how many tokens the evidence would have if embedded
+   ↓
+3. Compare against the embedder's max_tokens (typically 512)
+   ↓
+4. Does it fit in 1 chunk?
+     ├─ YES → you can retrieve with k=1, metrics will be optimistic
+     └─ NO  → you need chunking + retrieval with k>1
+   ↓
+5. Chunking strategy + appropriate k value
+```
+
+Grounded in our numbers:
+
+| Percentile | Chars | Tokens (~÷4) | Fits in 512-token chunk? |
+|---|---:|---:|---|
+| Median | 1,450 | ~362 | ✅ Plenty of room |
+| p75 | 2,267 | ~566 | ⚠️ Just barely overflows → needs 2 chunks |
+| p95 | 4,194 | ~1,048 | ❌ Needs 2-3 chunks |
+| Max | 12,123 | ~3,030 | 🚨 Needs 6+ chunks |
+
+**Technical conclusion**: for ~25-30% of the dataset, the full evidence does **NOT fit in 1 chunk**. That's why this project:
+
+- **Reports Recall@k for several k values** (k=1, 3, 5, 10) — covers from "perfect retrieval at top-1" to "evidence somewhere in top-10"
+- **Reports MAP** — rewards retrieving multiple chunks when the evidence spans across them
+- **Compares 4 chunking strategies** — none wins at all percentiles
+
+> 💡 **If we only measured the mean (1,712 chars)**, we'd lose the long tail. We'd design a system assuming the typical evidence is ~1,712 chars and the outliers would surprise us. That's why **always median + percentiles**, never mean alone.
 
 ### Golden rule
 
