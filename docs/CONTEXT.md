@@ -20,6 +20,7 @@
 10. [The RAG pipeline — retrieval, reranking, generation](#10-the-rag-pipeline--retrieval-reranking-generation)
 11. [How we measure success: retrieval metrics](#11-how-we-measure-success-retrieval-metrics)
 12. [Putting it all together — a worked example end-to-end](#12-putting-it-all-together--a-worked-example-end-to-end)
+13. [Parsing PDFs — from positioned glyphs to indexable structure](#13-parsing-pdfs--from-positioned-glyphs-to-indexable-structure)
 
 ---
 
@@ -969,6 +970,226 @@ If this diagram clicks — *that's* the moment §1-§11 stop being a list of tec
 | "generation" | §10 — Phase 3 (Eslabón 2) |
 
 That's the whole project in one picture. Welcome to RAG engineering.
+
+---
+
+## 13. Parsing PDFs — from positioned glyphs to indexable structure
+
+> **Why this section exists**: §1-§12 build the conceptual framework — what a filing is, what evidence looks like, how RAG operates, how we measure it. But there's a gap between *concept* and *execution* that none of those sections close: HOW do we actually turn 84 binary PDFs into a structured corpus the embedder can ingest? This section is the theoretical anchor for `notebooks/02_financebench_exploration.ipynb` §3 and for `scripts/parse_pdfs.py`. Read this before running the notebook cells, and the demos will land with their full pedagogical weight.
+
+### 13.1 Why a PDF is hostile to ML — the PostScript inheritance
+
+PDF (Portable Document Format, Adobe 1993) is a direct descendant of **PostScript**, the page-description language Adobe shipped in 1985 to drive laser printers. PostScript's job was *"tell the printer where to put ink on the page"*. PDF inherited that DNA verbatim — it describes how to *render* a page, not how to *represent* its content.
+
+The consequence for ML: when you see *"Net sales 32,765"* on screen, the PDF stores something closer to:
+
+```text
+glyph "N"  at (x0=72.0,  top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph "e"  at (x0=78.4,  top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph "t"  at (x0=84.1,  top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph " "  at (x0=88.6,  top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph "s"  at (x0=92.0,  top=540.5)  font=BCDEEE+ArialMT  size=10
+...
+glyph "3"  at (x0=420.0, top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph "2"  at (x0=425.4, top=540.5)  font=BCDEEE+ArialMT  size=10
+glyph "," at (x0=430.8, top=540.5)  font=BCDEEE+ArialMT  size=10
+...
+```
+
+There is **no native concept** of "paragraph", "table", "heading", "section", "row", or "cell". Just rectangles and glyphs. Any structure a human reader perceives — a heading vs. a paragraph, a table vs. a list — exists nowhere in the file; it has to be **reconstructed by the parser** from coordinate proximity and font-size patterns.
+
+This makes parsing a PDF fundamentally different from parsing JSON or HTML, where structure is explicit. With PDF you're doing **layout reverse-engineering**, and every parser library makes different bets about how aggressive to be:
+
+- *Conservative* (e.g., `pypdf`): just emit characters in reading order; let the user deal with structure.
+- *Heuristic* (e.g., `pdfplumber`): detect tables via vertical/horizontal alignment, but accept some false positives.
+- *ML-based* (e.g., `Marker`, `Docling`): train a layout-detection model on labeled documents; expensive but accurate.
+
+> 💡 **Mental model**: parsing a PDF is closer to OCR-on-vector-graphics than to reading a text file. Treat every parser as a *guess* about layout, not a *fact* about content. Validate the guess on real pages of your corpus before trusting the output.
+
+---
+
+### 13.2 Head-to-head — five Python libraries evaluated
+
+The Python ecosystem has competing PDF parsers, each making different trade-offs. We evaluated five for this project:
+
+| Library | How it works | Tables | Speed | Setup | Verdict for 10-K |
+|---|---|---|---|---|---|
+| **`pypdf`** | Heuristic, pure Python | ❌ Flattens to lines | ⚡ Fast | Trivial | OK for narrative; tables masacred |
+| **`pdfplumber`** | Wrapper over `pdfminer.six`; exposes coords + bboxes + heuristic table detection | ✅ Decent on bordered tables | ⚡ Fast | Trivial | **🏆 Winner** |
+| **`PyMuPDF`** (fitz) | Bindings for MuPDF (Artifex C library) | ⚠️ Limited table API | 🚀 Very fast | C lib | Excellent for text; AGPL friction |
+| **`tabula-py`** | Wrapper around `tabula-java` | ✅ Good for tables | 🐌 Slower | JRE required | Setup friction; tables-only |
+| **`Marker`** / **`Docling`** | Layout detection via PyTorch models | 🏆 Best quality | 🐌 10-50ms/page | PyTorch + models | Overkill for Stage 1; revisit if metrics demand |
+
+Why `pdfplumber` won, in three points anchored to **this corpus**:
+
+1. **10-K financial statements come with visible borders and ruling lines** (Income Statement, Balance Sheet, Cash Flows). This is precisely the case where heuristic table detection works — you don't need a layout-detection ML model when the layout is already explicit in the rendering primitives.
+2. **It exposes raw coordinates** (`page.chars`, `page.rects`, `page.lines`). When the heuristic fails on an edge case (merged cells, unusual notes), we can drop to low-level access and write custom logic. `pypdf` doesn't allow that — once it returns the flattened string, the structure is gone.
+3. **Zero setup friction**: pure Python, MIT license, no JRE, no GPU, no model weights to download. 84 PDFs × ~140 pages averaged ~16 seconds each on a single thread — full corpus parsed in ~26 minutes total. ML-based parsers would push that to hours without GPU.
+
+> ⚠️ **What about the AGPL on PyMuPDF?** AGPL requires that any service exposing PyMuPDF over the network release its full server source under AGPL. For a research repo this is acceptable, but if you ever wrap the parser in a SaaS product, AGPL forces decisions you may not want. `pdfplumber`'s MIT license sidesteps that risk entirely.
+
+---
+
+### 13.3 The default-settings gotcha — why ruling-lines fail on 10-K
+
+This is the most common source of silent corruption when parsing financial filings, and the live demo in `notebooks/02_financebench_exploration.ipynb` §3.1 surfaces it directly. Worth understanding the underlying mechanic.
+
+**`pdfplumber.extract_tables()` has two strategies for finding rows and columns**:
+
+| Strategy | How it detects boundaries |
+|---|---|
+| `lines` (DEFAULT) | Looks for **drawn line segments** in the PDF (vector primitives) |
+| `text` | Clusters glyphs into rows/columns by **x/y proximity** |
+
+The default uses `lines` because it's the most reliable when tables have clean borders (the typical case in PDFs generated from Word/LaTeX). But in **10-K filings**, the layout of a Consolidated Statement of Income looks like this:
+
+```
+─────────────────────────────────────
+Net sales       $ 32,765  $ 31,657  $ 30,109
+─────────────────────────────────────
+Cost of sales     16,682    16,055    15,118
+─────────────────────────────────────
+Operating income   7,207     6,920     6,494
+─────────────────────────────────────
+```
+
+Every row has its OWN horizontal separator line. The `lines` heuristic sees those line segments and concludes that **each row is its own one-row table**. Result: a single Income Statement of 33 logical rows gets fragmented into ~12 sub-tables. Each fragment is a one-row matrix that, taken in isolation, has no header context — exactly the failure we're trying to avoid.
+
+**The fix is one parameter change**:
+
+```python
+settings = {"vertical_strategy": "text", "horizontal_strategy": "text"}
+tables = page.extract_tables(settings)
+```
+
+With `text` strategy, the heuristic ignores the ruling lines and instead clusters glyphs by spatial proximity. The 33 logical rows become a single 33-row × 10-col matrix, header preserved at row 0. This becomes the **project-default `table_settings`**, applied uniformly across all 84 PDFs in `scripts/parse_pdfs.py`.
+
+> 🧠 **Pedagogical lesson**: a parser's "default" reflects the assumptions of the *typical* document the maintainers had in mind. Whenever you adopt a parsing library, **explicitly verify those assumptions against your corpus** on day 1. The cost of finding this gotcha after embedding all 84 PDFs and seeing weird retrieval results would have been a full re-parse (~26 minutes), full re-embed (~$2.50), and hours of debugging. The cost of finding it on page 56 of one PDF in the notebook is zero. Spend the day-1 investment.
+
+---
+
+### 13.4 Three table-chunking techniques — the math behind the trade-off
+
+Even with `pdfplumber` returning a clean 2D matrix, a chunking-layer problem remains: **what do we do when the table exceeds the embedder's context window?** Recall from §2.3 of the notebook that ~25-30% of FinanceBench evidence exceeds 512 tokens — and almost all of those large evidences are **tables**.
+
+Three standard techniques exist. Each makes a different bet about which information to preserve:
+
+#### a) Whole-table-as-one-chunk
+
+Bump the chunk size *for that table* to fit it in one shot. Dense embedders that accept long contexts — BGE-M3 (8192 tokens), OpenAI `text-embedding-3-large` (8191), Voyage `voyage-finance-2` (16k) — make this feasible.
+
+- **Preserves**: full table semantics, header ↔ data association across all rows, contextual prose surrounding the table.
+- **Loses**: nothing structural.
+- **Trade-off**: chunk sizes become bimodal (most prose chunks ~512 tokens, some table chunks ~3000+). This breaks the assumption of uniform chunk length that some retrieval algorithms make. Also: per-token API pricing means a 3000-token chunk costs 6× more to embed than a 512-token chunk.
+
+#### b) Header-repetition
+
+Split the table by rows but **repeat the header row in every chunk**.
+
+- **Preserves**: row ↔ column association at every chunk boundary (because the header travels with each chunk).
+- **Loses**: subtle inter-row context (e.g., a footnote that referred to "the prior row" is now stranded).
+- **Trade-off**: simple, predictable chunk sizes, modest token duplication (~10-20% overhead from repeated headers).
+
+The math: if the table has H rows of header + N rows of data, and we want chunks of M data rows each:
+
+```
+chunks_produced = ceil(N / M)
+total_tokens    = (H + N) * tokens_per_row + (chunks_produced - 1) * H * tokens_per_row
+                = (H + N) * tokens_per_row × (1 + (chunks_produced - 1) * H / (H + N))
+```
+
+For the 3M Income Statement (H=1, N=32, M=10): 4 chunks, ~10% token overhead from header duplication. Acceptable.
+
+#### c) Row-as-sentence (linearization)
+
+Convert each row to natural prose: *"In 2018 Net sales were $32,765M; in 2017 they were $31,657M; in 2016 they were $30,109M."*
+
+- **Preserves**: semantic content, dense embedders read it naturally as English.
+- **Loses**: numerical precision if the conversion fails on edge cases (scientific notation, parenthesized negatives, footnote markers).
+- **Trade-off**: best embedding quality on **narrative-style queries** (the embedder's strong suit), worst on **lookup-style queries** (where exact numerical match matters). Also: linearization is itself a parser — bugs there propagate silently.
+
+#### Why the baseline picks header-repetition (b)
+
+For Stage 1 (baseline naive 512 + overlap 50), header-repetition is the cleanest contrast against the other 3 chunking strategies (semantic, contextual, late-chunking). It's also the easiest to get right — ~20 lines of code, no risk of conversion bugs. We reserve technique (a) for the **late-chunking experiment** (Stage 2) which specifically bets on long-context embedders. We reserve technique (c) for an **optional Stage 3 experiment** if numerical-reasoning queries (~29% of the dataset, see §6 reasoning types) systematically fail retrieval.
+
+> ⚠️ **None of these techniques is universally correct.** The choice depends on (i) the embedder's context window, (ii) the query distribution, (iii) the cost-per-embedding budget. Documenting the choice and its rationale in `docs/chunking_decisions.md` (sub-block 6) is the audit trail that makes the project defensible.
+
+---
+
+### 13.5 Quantitative grounding — the corpus in numbers
+
+After running `scripts/parse_pdfs.py` over the 84 PDFs, we can put hard numbers on the corpus. These are not estimates from a sample — they're measured over all 11,853 parsed pages:
+
+| Quantity | Value | Note |
+|---|---|---|
+| **PDFs processed** | 84 | All open-source FinanceBench docs |
+| **Pages parsed** | 11,853 | Average 141 pages/PDF |
+| **JSONL on disk** | 107.5 MB | One file per PDF, gzip-compressible to ~30 MB |
+| **Total text chars** | 39.9 M | Narrative + flattened table content from `extract_text()` |
+| **Total table cell chars** | 37.8 M | Sum of `len(cell)` across all tables × all pages |
+| **Estimated tokens** | ~19.4 M | Using the standard ~4 chars/token ratio for English |
+| **Estimated chunks (baseline)** | ~63,000 | At 512 tokens with overlap 50; pre-filtering false-positive tables |
+
+#### From token count to dollar cost
+
+Embedding the corpus once with OpenAI `text-embedding-3-large` (price: $0.13 per 1M tokens):
+
+```
+19.4 M tokens × $0.13 / 1M = $2.52 per embedder pass
+```
+
+Across the full experiment (5 embedders × 4 chunking strategies, with caching of identical chunks across strategies):
+
+```
+Worst case (no caching):     20 × $2.52 = $50.40
+Realistic (50% chunk reuse):  ~$25-30
+```
+
+Both numbers fit comfortably inside the project's $40-50 USD budget. **This is the data point that converts the experimental plan from "feasible-on-paper" to "feasible-with-evidence"** — the kind of number a reviewer at a Senior AI Engineer interview will explicitly ask about.
+
+> 💡 **Pattern to internalize**: every architecture decision in a paper-quality project should ladder back to a measurable cost (time, money, error budget). "We chose X because Y" is weaker than "We chose X because Y, and on this corpus Y means Z dollars / Z minutes / Z accuracy points." The parsed corpus gives us Z.
+
+---
+
+### 13.6 Architectural payoff — the parser/chunker boundary
+
+The deepest design lesson of this sub-block is **architectural**, not specific to PDFs or `pdfplumber`. It's about *separation of concerns* between two layers that are tempting to merge:
+
+```
+┌──────────────────────────────────┐
+│  Layer 1: PARSER                 │
+│  Input:  binary PDF              │
+│  Output: structured JSONL        │
+│          {doc_name, page_num,    │
+│           text, tables}          │
+│  Concern: faithful extraction    │
+│           of raw structure       │
+└──────────────────────────────────┘
+              │
+              ▼
+┌──────────────────────────────────┐
+│  Layer 2: CHUNKER                │
+│  Input:  structured JSONL        │
+│  Output: list of embeddable      │
+│          chunks with metadata    │
+│  Concern: how to cut and present │
+│           structure for the      │
+│           embedder               │
+└──────────────────────────────────┘
+              │
+              ▼
+   [Embedder layer — separate again]
+```
+
+**Why the boundary matters**:
+
+- **Compare 4 chunking strategies on the same parsed output**. If parser and chunker were fused, we'd re-parse the 84 PDFs 4 times (~104 min total). Separated, we parse once (~26 min) and chunk 4 times in seconds.
+- **Swap the parser without touching the chunker**. If `Marker` becomes the right call in Stage 2-3 (better merged-cell handling, e.g.), only Layer 1 changes — the chunking strategies, the embedders, and the metrics all remain untouched.
+- **Audit each layer in isolation**. Failures in retrieval can be diagnosed by checking parser output (matrix correct?) before chunker output (chunks readable?). Without separation, every failure is a mystery.
+
+This pattern generalizes far beyond financial RAG. Any project that ingests heterogeneous documents (legal contracts, scientific papers, medical records, code repositories) benefits from the same boundary. **The boundary is the architectural payoff that makes the project portable** to other domains.
+
+> 🎯 **Carry-forward principle**: when you build a pipeline that has a "structured representation" stage, persist that representation to disk explicitly (JSONL, Parquet, Arrow). The downstream stages then become re-runnable, comparable, and debuggable in ways a fused pipeline never can be.
 
 ---
 
