@@ -1,6 +1,6 @@
 # Microsoft Foundry — Setup Guide
 
-> **Provider transversal cloud** del proyecto. Sirve para acceder a `text-embedding-3-large` (Stage 1) y a los modelos de embedding/LLM/rerank de Stages 2-3 sin manejar N API keys distintas.
+> **Provider transversal cloud** del proyecto. Sirve para acceder a `text-embedding-3-small` (Stage 1) y a los modelos de embedding/LLM/rerank de Stages 2-3 sin manejar N API keys distintas.
 >
 > Este doc cubre **cómo conseguir credenciales y validarlas**. La integración en código vive en [`src/embeddings/foundry_client.py`](../src/embeddings/foundry_client.py) y se documenta paso a paso en [`notebooks/03_foundry_setup.ipynb`](../notebooks/03_foundry_setup.ipynb).
 
@@ -11,7 +11,7 @@
 1. Cuenta de Azure activa (free tier sirve para smoke tests)
 2. Acceso a [Microsoft Foundry](https://ai.azure.com) (login con la misma cuenta de Azure)
 3. Un **Project** de Foundry creado (no un Hub legacy — Foundry usa el concepto "Project")
-4. Un **deployment** de `text-embedding-3-large` dentro de ese Project (UI → Models + endpoints → Deploy)
+4. Un **deployment** de `text-embedding-3-small` dentro de ese Project (UI → Models + endpoints → Deploy)
 
 ---
 
@@ -38,7 +38,7 @@ Es un string opaco largo. **NO la pegues nunca en el chat ni en commits.** Va di
 
 UI: **Models + endpoints → tu deployment → Name**
 
-⚠️ **Gotcha**: el deployment name NO siempre coincide con el model name de OpenAI. Si lo creaste con el nombre por defecto, suele ser `text-embedding-3-large`. Si le pusiste otro (`my-embedder-prod`, etc.), usa ese.
+⚠️ **Gotcha**: el deployment name NO siempre coincide con el model name de OpenAI. Si lo creaste con el nombre por defecto, suele ser `text-embedding-3-small`. Si le pusiste otro (`my-embedder-prod`, etc.), usa ese.
 
 ---
 
@@ -49,7 +49,7 @@ cp .env.example .env
 # Edita el .env y reemplaza los placeholders:
 #   AZURE_FOUNDRY_ENDPOINT=PEGA_TU_ENDPOINT_AQUI
 #   AZURE_FOUNDRY_API_KEY=PEGA_TU_KEY_AQUI
-#   AZURE_FOUNDRY_EMBEDDING_DEPLOYMENT=text-embedding-3-large
+#   AZURE_FOUNDRY_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 ```
 
 Verificar que cargan:
@@ -84,11 +84,13 @@ El siguiente paso es enchufar esto desde Python en el notebook `03_foundry_setup
 
 ## Costos
 
-`text-embedding-3-large` cuesta **$0.13 por 1M tokens** vía Azure (mismo precio que OpenAI directo). Vectorizar los 31K chunks del FinanceBench Loader (~12.58M tokens según el log del Stage 1) cuesta:
+`text-embedding-3-small` cuesta **$0.02 por 1M tokens** vía Azure (mismo precio que OpenAI directo). Vectorizar los 31K chunks del FinanceBench Loader (~12.58M tokens según el log del Stage 1) cuesta:
 
 ```
-12.58M tokens × $0.13/M ≈ $1.64 por embedder pass
+12.58M tokens × $0.02/M ≈ $0.25 por embedder pass
 ```
+
+**Nota**: usamos `text-embedding-3-small` (1536 dim) en lugar de `large` (3072 dim) porque es **6× más barato** y para el dominio financiero (10-K filings) el lift de calidad de `large` no compensa. Si querés re-embeddear todo con `large`, el deployment es independiente y podés hacerlo en paralelo (cuesta ~$1.64 por pass).
 
 Una sola corrida. Si re-corres por bug, son otros $1.64. Vale la pena cachear los vectores en disco después del primer pass (planeado en `Sub-bloque 7 — Cost tracking básico`).
 
