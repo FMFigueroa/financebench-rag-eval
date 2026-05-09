@@ -1,9 +1,17 @@
 """Microsoft Foundry embedding client (provider transversal cloud).
 
-Wrapper sobre `azure.ai.inference.EmbeddingsClient` que carga credenciales
+Wrapper sobre el SDK `openai` apuntando al endpoint Azure OpenAI v1
+(`https://<resource>.openai.azure.com/openai/v1/`). Carga credenciales
 desde `.env` y expone una interfaz consistente con los otros embedders del
 proyecto (`OpenAIEmbedder`, `BGEEmbedder`, etc.) para drop-in en el
 `Eval Pipeline`.
+
+Por qué SDK `openai` y no `azure-ai-inference`:
+  - Microsoft mismo recomienda `openai` para embeddings (el endpoint del
+    Project del Foundry SDK no rutea embedding requests).
+  - `azure-ai-inference` está deprecated (retire 26 ago 2026).
+  - Compatibilidad 1:1 con OpenAI directo (cambiar 1 var migra de Azure
+    OpenAI a OpenAI sin tocar código).
 
 Uso típico:
 
@@ -14,6 +22,7 @@ Uso típico:
     # vectors: np.ndarray shape (2, 1536) para text-embedding-3-small
 
 Memoria descriptiva: https://www.notion.so/35a6ad30ca11811d96ebf4a9d7dde20b
+Setup detallado:     docs/foundry_setup.md
 """
 
 from __future__ import annotations
@@ -25,9 +34,8 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from azure.ai.inference import EmbeddingsClient
-from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
@@ -66,22 +74,31 @@ class FoundryConfig:
 
 
 class FoundryEmbedder:
-    """Embedder que consume modelos de embeddings desde Microsoft Foundry."""
+    """Embedder que consume modelos de embeddings desde Microsoft Foundry
+    via el endpoint Azure OpenAI v1 + SDK `openai`."""
 
     def __init__(self, config: FoundryConfig | None = None) -> None:
         self.config = config or FoundryConfig.from_env()
-        self._client = EmbeddingsClient(
-            endpoint=self.config.endpoint,
-            credential=AzureKeyCredential(self.config.api_key),
+        self._client = OpenAI(
+            api_key=self.config.api_key,
+            base_url=self.config.endpoint,
         )
 
     def embed(self, texts: Iterable[str]) -> np.ndarray:
-        """Vectoriza una lista de textos. Devuelve ndarray shape (n, dim)."""
+        """Vectoriza una lista de textos. Devuelve ndarray shape (n, dim).
+
+        ⚠️ Sin batch logic interna — una sola llamada por invocación. Para
+        corpus grandes (≥2K inputs por request es el max de Azure OpenAI),
+        orquestar el batch desde fuera con cost tracking (sub-bloque 7).
+        """
         texts = list(texts)
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
 
-        response = self._client.embed(input=texts, model=self.config.deployment)
+        response = self._client.embeddings.create(
+            input=texts,
+            model=self.config.deployment,
+        )
         vectors = [np.asarray(item.embedding, dtype=np.float32) for item in response.data]
         return np.stack(vectors, axis=0)
 
@@ -89,7 +106,7 @@ class FoundryEmbedder:
         """Devuelve la dimensión del vector que produce el modelo desplegado.
 
         Para `text-embedding-3-small` es 1536. Para `-large` es 3072.
-        Si necesitás el valor antes de la primera llamada, hardcodeálo desde
+        Si necesitas el valor antes de la primera llamada, hardcodéalo desde
         el config; aquí lo derivamos del primer embed real para evitar
         suposiciones.
         """
@@ -113,7 +130,7 @@ def smoke_test() -> dict:
     Útil para validar credenciales sin tocar el corpus. Lanza si algo falla.
     """
     embedder = FoundryEmbedder()
-    sample = "Apple's revenue in fiscal year 2023 was $383 billion."
+    sample = "smoke test from Foundry"
     vec = embedder.embed([sample])
     return {
         "endpoint": embedder.config.endpoint,
@@ -132,7 +149,7 @@ def smoke_test_with_real_chunk(
     """Smoke test sobre 1 chunk real del corpus FinanceBench.
 
     Por default agarra el primer chunk de `MICROSOFT_2023_10K.jsonl` (estable
-    como referencia). Pasale otro path si querés probar con un doc distinto.
+    como referencia). Pasale otro path si quieres probar con un doc distinto.
     """
     path = jsonl_path or (DEFAULT_CHUNKS_DIR / "MICROSOFT_2023_10K.jsonl")
     if not path.exists():
