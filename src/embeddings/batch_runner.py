@@ -27,6 +27,12 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import tiktoken
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 from src.embeddings.foundry_client import (
     DEFAULT_CHUNKS_DIR,
@@ -67,14 +73,15 @@ def load_chunks(chunks_dir: Path) -> list[dict]:
 
 def make_batches(
     chunks: list[dict],
-    max_tokens: int = 800_000,
+    max_tokens: int = 50_000,
     max_inputs: int = AZURE_MAX_INPUTS_PER_REQUEST,
 ) -> list[list[dict]]:
     """Group chunks into dynamic batches that respect BOTH limits.
 
-    max_tokens default (800K) leaves a margin below the request size that would
-    saturate the TPM limit (~1.05M tokens at full array size), giving the
-    server room to breathe between batches.
+    max_tokens default (50K) is BELOW the hard 64K-tokens-per-request limit
+    that text-embedding-3-small enforces server-side (HTTP 413 if exceeded).
+    This limit is NOT documented in the Foundry portal — discovered via
+    failed batch run on 2026-05-10.
     """
     batches: list[list[dict]] = []
     current_batch: list[dict] = []
@@ -182,7 +189,9 @@ def embed_corpus(
             flush=True,
         )
 
-        # Embed with exponential backoff on transient errors
+        # Embed with exponential backoff — but ONLY on transient errors.
+        # 4xx (except 429) are NOT retriable — fail fast to avoid wasting time
+        # on errors that won't fix themselves (e.g. 413 payload too large).
         retries = 0
         while True:
             try:
@@ -190,6 +199,15 @@ def embed_corpus(
                 vectors = embedder.embed(texts)  # np.ndarray shape (n, dim)
                 break
             except Exception as e:
+                is_retriable = (
+                    isinstance(e, (RateLimitError, APITimeoutError, APIConnectionError))
+                    or (isinstance(e, APIStatusError) and e.status_code >= 500)
+                )
+                if not is_retriable:
+                    print(
+                        f"\n   ❌ {type(e).__name__} (not retriable): {e}"
+                    )
+                    raise
                 retries += 1
                 if retries > max_retries:
                     raise
