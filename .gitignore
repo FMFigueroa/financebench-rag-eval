@@ -58,3 +58,6 @@ Thumbs.db
 # MLflow / W&B
 mlruns/
 wandb/
+
+# Run logs (background processes)
+logs/
