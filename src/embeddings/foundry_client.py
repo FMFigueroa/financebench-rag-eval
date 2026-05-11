@@ -2,12 +2,12 @@
 
 Wrapper sobre el SDK `openai` apuntando al endpoint Azure OpenAI v1
 (`https://<resource>.openai.azure.com/openai/v1/`). Carga endpoint +
-deployment desde `.env` y autentica via Azure AD usando el token de la
-sesión `az login` — sin API keys que rotar ni almacenar.
+deployment desde `.env` y autentica via Microsoft Entra ID usando OAuth.
+usa el token de la sesión `az login` — sin API keys que rotar ni almacenar.
 
-Por qué Azure AD en vez de API key:
+Por qué Microsoft Entra ID en vez de API key:
   - Cero secretos persistentes en el código ni en el `.env`.
-  - Auth atada a tu identidad de Azure AD (revocación inmediata si rotas).
+  - Auth atada a tu identidad de Microsoft Entra ID (revocación inmediata si rotas).
   - Estándar production: mismo patrón funciona en CI/CD con Managed Identity.
   - Pre-requisito: ejecutar `az login` antes de usar este módulo.
 
@@ -49,8 +49,8 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS_DIR = REPO_ROOT / "data" / "processed" / "chunks"
 
-# Scope de Azure AD para Cognitive Services / Azure OpenAI. Identifier que indica
-# qué API estás autorizando — no es una URL llamable.
+# Scope de Microsoft Entra ID para Cognitive Services / Azure OpenAI. Identifier
+# que indica qué API estás autorizando — no es una URL llamable.
 AZURE_OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
@@ -81,13 +81,13 @@ class FoundryConfig:
 
 class FoundryEmbedder:
     """Embedder que consume modelos de embeddings desde Microsoft Foundry
-    via el endpoint Azure OpenAI v1 + SDK `openai` + auth Azure AD."""
+    via el endpoint Azure OpenAI v1 + SDK `openai` + auth Microsoft Entra ID."""
 
     def __init__(self, config: FoundryConfig | None = None) -> None:
         self.config = config or FoundryConfig.from_env()
 
-        # Token provider: función que devuelve un Bearer token fresco para Azure AD
-        # cada vez que se invoca. DefaultAzureCredential autodetecta la fuente
+        # Token provider: función que devuelve un Bearer token fresco para Microsoft
+        # Entra ID cada vez que se invoca. DefaultAzureCredential autodetecta la fuente
         # (az CLI, env vars, Managed Identity, etc.) en orden estándar.
         token_provider = get_bearer_token_provider(
             DefaultAzureCredential(),
