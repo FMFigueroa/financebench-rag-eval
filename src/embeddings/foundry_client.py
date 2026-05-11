@@ -1,10 +1,15 @@
 """Microsoft Foundry embedding client (provider transversal cloud).
 
 Wrapper sobre el SDK `openai` apuntando al endpoint Azure OpenAI v1
-(`https://<resource>.openai.azure.com/openai/v1/`). Carga credenciales
-desde `.env` y expone una interfaz consistente con los otros embedders del
-proyecto (`OpenAIEmbedder`, `BGEEmbedder`, etc.) para drop-in en el
-`Eval Pipeline`.
+(`https://<resource>.openai.azure.com/openai/v1/`). Carga endpoint +
+deployment desde `.env` y autentica via Azure AD usando el token de la
+sesión `az login` — sin API keys que rotar ni almacenar.
+
+Por qué Azure AD en vez de API key:
+  - Cero secretos persistentes en el código ni en el `.env`.
+  - Auth atada a tu identidad de Azure AD (revocación inmediata si rotas).
+  - Estándar production: mismo patrón funciona en CI/CD con Managed Identity.
+  - Pre-requisito: ejecutar `az login` antes de usar este módulo.
 
 Por qué SDK `openai` y no `azure-ai-inference`:
   - Microsoft mismo recomienda `openai` para embeddings (el endpoint del
@@ -29,11 +34,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -43,45 +49,54 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS_DIR = REPO_ROOT / "data" / "processed" / "chunks"
 
+# Scope de Azure AD para Cognitive Services / Azure OpenAI. Identifier que indica
+# qué API estás autorizando — no es una URL llamable.
+AZURE_OPENAI_SCOPE = "https://cognitiveservices.azure.com/.default"
+
 
 @dataclass(frozen=True)
 class FoundryConfig:
     endpoint: str
-    api_key: str
     deployment: str
 
     @classmethod
-    def from_env(cls) -> "FoundryConfig":
+    def from_env(cls) -> FoundryConfig:
         endpoint = os.getenv("AZURE_FOUNDRY_ENDPOINT", "")
-        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
         deployment = os.getenv("AZURE_FOUNDRY_EMBEDDING_DEPLOYMENT", "")
 
         missing = [
             k
             for k, v in {
                 "AZURE_FOUNDRY_ENDPOINT": endpoint,
-                "AZURE_FOUNDRY_API_KEY": api_key,
                 "AZURE_FOUNDRY_EMBEDDING_DEPLOYMENT": deployment,
             }.items()
             if not v or "PEGA" in v
         ]
         if missing:
             raise RuntimeError(
-                f"Faltan variables Foundry en .env: {missing}. "
-                f"Ver docs/foundry_setup.md."
+                f"Faltan variables Foundry en .env: {missing}. Ver docs/foundry_setup.md."
             )
-        return cls(endpoint=endpoint, api_key=api_key, deployment=deployment)
+        return cls(endpoint=endpoint, deployment=deployment)
 
 
 class FoundryEmbedder:
     """Embedder que consume modelos de embeddings desde Microsoft Foundry
-    via el endpoint Azure OpenAI v1 + SDK `openai`."""
+    via el endpoint Azure OpenAI v1 + SDK `openai` + auth Azure AD."""
 
     def __init__(self, config: FoundryConfig | None = None) -> None:
         self.config = config or FoundryConfig.from_env()
+
+        # Token provider: función que devuelve un Bearer token fresco para Azure AD
+        # cada vez que se invoca. DefaultAzureCredential autodetecta la fuente
+        # (az CLI, env vars, Managed Identity, etc.) en orden estándar.
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            AZURE_OPENAI_SCOPE,
+        )
+
         self._client = OpenAI(
-            api_key=self.config.api_key,
             base_url=self.config.endpoint,
+            api_key=token_provider(),
         )
 
     def embed(self, texts: Iterable[str]) -> np.ndarray:
@@ -180,8 +195,5 @@ if __name__ == "__main__":
     import sys
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "synthetic"
-    if mode == "real":
-        result = smoke_test_with_real_chunk()
-    else:
-        result = smoke_test()
+    result = smoke_test_with_real_chunk() if mode == "real" else smoke_test()
     print(json.dumps(result, indent=2))

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.97.0",
+    "azure-identity>=1.25.3",
     "cohere>=6.1.0",
     "datasets>=4.8.4",
     "matplotlib>=3.10.9",
@@ -53,6 +54,11 @@ select = [
 ignore = [
     "E501",  # line-too-long: handled by the formatter
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Pedagogical notebooks build modules piece-by-piece (intentional redefinitions
+# and per-cell imports). Linting them as production code defeats the teaching purpose.
+"notebooks/04_foundry_from_scratch.ipynb" = ["F811", "I001", "E402", "F404"]
 
 [tool.ruff.format]
 quote-style = "double"
